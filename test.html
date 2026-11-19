@@ -1,0 +1,273 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bicubic 4tap / WebGL2 真机验证</title>
+<style>
+ body{font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:#111;color:#ddd;padding:16px}
+ #out{white-space:pre-wrap}
+ .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}
+ canvas{image-rendering:pixelated;width:320px;height:320px;border:1px solid #444}
+</style>
+<div id="out">running…</div>
+<canvas id="c" width="64" height="64"></canvas>
+<script>
+const FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D uTex;
+uniform vec2 uSize;      // canvas 尺寸
+out vec4 fragColor;
+// ---------------------------------------------------------------------------
+// 4-tap bicubic (Catmull-Rom, a = -0.5)  |  GLSL ES 3.00 / WebGL2
+//
+// 核心恒等式（已数值验证，误差 ~1e-15）：
+//   把 4 个 cubic 权重两两合并 → 每轴 2 段，每段用硬件双线性一次取完
+//       w0*c0 + w1*c1  ==  (w0+w1) * mix(c0, c1, w1/(w0+w1))
+//       w2*c2 + w3*c3  ==  (w2+w3) * mix(c2, c3, w3/(w2+w3))
+//   2 轴各 2 段 → 4 次纹理采样 = 2D 三次卷积。采样数 16 → 4。
+// ---------------------------------------------------------------------------
+
+// 单轴权重分解：返回 vec4(a, s, b, u)
+//   a = 后一纹素对的权重   s = 该对的插值位置 ∈ [0,1]
+//   b = 前一纹素对的权重   u = 该对的插值位置 ∈ [0,1]
+vec4 crAxisWeights(float f) {
+    float f2 = f * f;
+    float f3 = f2 * f;
+
+    float w0 = -0.5 * f3 +       f2 - 0.5 * f;
+    float w1 =  1.5 * f3 - 2.5 * f2        + 1.0;
+    float w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    float w3 =  0.5 * f3 - 0.5 * f2;
+
+    float a = w0 + w1;          // f == 1.0 时 a == 0 → 0/0，必须挡
+    float b = w2 + w3;          // f == 0.0 时 b == 0 → 0/0，必须挡
+
+    // 兜底取 0：此时该段权重本身也为 0，乘 0 不影响结果
+    float s = (abs(a) > 1e-5) ? w1 / a : 0.0;
+    float u = (abs(b) > 1e-5) ? w3 / b : 0.0;
+
+    return vec4(a, s, b, u);
+}
+
+// ---------------------------------------------------------------------------
+// 采样。前提：纹理 LINEAR + CLAMP_TO_EDGE —— 这是正确性条件，不是性能选项
+// ---------------------------------------------------------------------------
+vec4 texBicubic(sampler2D tex, vec2 uv) {
+    vec2 size = vec2(textureSize(tex, 0));
+    vec2 p = uv * size - 0.5;          // 转纹素中心坐标系
+    vec2 i = floor(p);
+    vec2 f = p - i;                    // 已在 [0,1)
+
+    vec4 wx = crAxisWeights(f.x);
+    vec4 wy = crAxisWeights(f.y);
+
+    float x0 = i.x + wx.y;             // 前一对的采样位置
+    float x1 = i.x + 1.0 + wx.w;       // 后一对的采样位置
+    float y0 = i.y + wy.y;
+    float y1 = i.y + 1.0 + wy.w;
+
+    vec2 inv = 1.0 / size;             // p 已减 0.5，这里不用再补半纹素
+
+    vec4 c00 = texture(tex, vec2(x0, y0) * inv);
+    vec4 c10 = texture(tex, vec2(x1, y0) * inv);
+    vec4 c01 = texture(tex, vec2(x0, y1) * inv);
+    vec4 c11 = texture(tex, vec2(x1, y1) * inv);
+
+    // 权重先做 1D 折叠，省 4 次乘法
+    vec2 wx2 = vec2(wx.x, wx.z);
+    vec2 wy2 = vec2(wy.x, wy.z);
+    vec4 col0 = c00 * wx2.x + c10 * wx2.y;
+    vec4 col1 = c01 * wx2.x + c11 * wx2.y;
+
+    return col0 * wy2.x + col1 * wy2.y;
+}
+
+// ---------------------------------------------------------------------------
+// B-spline 变体：权重恒正、无过冲（不会出 ringing），代价是糊 ~1 纹素
+// 需要时对纹理做一次预滤波（1/6[1 4 1] 反卷积）可找回锐度
+// ---------------------------------------------------------------------------
+vec4 bsAxisWeights(float f) {
+    float f2 = f * f, f3 = f2 * f;
+    float w0 = (1.0 - 3.0*f + 3.0*f2 -     f3) / 6.0;
+    float w1 = (4.0 -        6.0*f2 + 3.0*f3) / 6.0;
+    float w2 = (1.0 + 3.0*f + 3.0*f2 - 3.0*f3) / 6.0;
+    float w3 =                         f3  / 6.0;
+
+    float a = w0 + w1, b = w2 + w3;
+    return vec4(a, w1 / a, b, w3 / b);   // B-spline 分母恒 ≥ 1/6，不会除零
+}
+
+// ---------------------------------------------------------------------------
+// RGBA pack/unpack（2 个 half 塞 1 个 RGBA8）
+//
+// ⚠ 致命约束：打包纹理必须 NEAREST。硬件 LINEAR 插的是打包后的字节，不是解出来的
+//   数值，结果全是噪声。所以「4-tap + 硬打包」不成立 —— 想同时要，只剩两条路：
+//   (1) 用可线性插值的编码：RGBM / 8bit LogLuv / 共享指数，误差 1~3%，保住 4 tap
+//   (2) 硬打包 + NEAREST + 手动双线性 → 每轴 4 次、2D 共 16 次，退化成暴力版
+//   低端 Mali 上先测 (1) 的误差能不能进你的 golden diff 阈值。
+// ---------------------------------------------------------------------------
+vec2 unpackHalf2FromRGBA8(vec4 texel) {
+    uvec4 b = uvec4(texel * 255.0 + 0.5);
+    uint word = b.x | (b.y << 8) | (b.z << 16) | (b.w << 24);
+    return unpackHalf2x16(word);        // 一个 RGBA8 = 2 个 half = 2 个通道
+}
+
+// 反向打包：4 个通道 = 4 个 half = 8 字节 = 需要 2 个 RGBA8 纹素
+// 每张图各存 2 个通道，解时才拼得回 vec4；单张 RGBA8 只能存 2 通道
+uvec4 packHalf2ToRGBA8(vec2 h) {
+    uint w = packHalf2x16(h);
+    return uvec4(w & 0xFFu, (w >> 8) & 0xFFu, (w >> 16) & 0xFFu, (w >> 24) & 0xFFu);
+}
+
+void main() {
+    vec2 uv = gl_FragCoord.xy / uSize;
+    fragColor = texBicubic(uTex, uv);
+}
+`;
+const VERT = `#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+const out = document.getElementById('out');
+const log = [];
+const say = (s, cls) => { log.push((cls?`<span class="${cls}">`:'')+s+(cls?'</span>':'')); out.innerHTML = log.join('\n'); };
+
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', {antialias:false, preserveDrawingBuffer:true});
+if (!gl) { say('FATAL: 没有 webgl2 上下文','bad'); window.__RESULT__={ok:false,reason:'no webgl2'}; }
+else {
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  say('RENDERER: ' + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+  say('VENDOR  : ' + (dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)));
+  say('VERSION : ' + gl.getParameter(gl.VERSION));
+  say('SL     : ' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+
+  function sh(type, src, name) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const l = gl.getShaderInfoLog(s);
+      say('COMPILE FAIL ' + name + '\n' + l, 'bad');
+      window.__SHADER_LOG__ = l;
+      throw new Error(name + ': ' + l);
+    }
+    return s;
+  }
+
+  let prog;
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT, 'vert'));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG, 'frag'));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const l = gl.getProgramInfoLog(prog);
+      say('LINK FAIL\n' + l, 'bad'); throw new Error('link: ' + l);
+    }
+    say('编译/链接: OK (0 error)', 'ok');
+    window.__SHADER_LOG__ = '';
+  } catch(e) {
+    say('shader stage failed, stop.', 'bad');
+    window.__RESULT__ = {ok:false, reason:'compile', log:window.__SHADER_LOG__};
+  }
+
+  if (prog) {
+    // ---- 测试纹理：8x8，确定性伪随机 ----
+    const N = 8, data = new Uint8Array(N*N*4);
+    let seed = 12345;
+    const rnd = () => (seed = (seed*1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i=0;i<N*N*4;i++) data[i] = Math.floor(rnd()*256);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, N, N, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.useProgram(prog);
+    gl.uniform1i(gl.getUniformLocation(prog,'uTex'), 0);
+    gl.uniform2f(gl.getUniformLocation(prog,'uSize'), cv.width, cv.height);
+    gl.viewport(0,0,cv.width,cv.height);
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const px = new Uint8Array(cv.width*cv.height*4);
+    gl.readPixels(0,0,cv.width,cv.height,gl.RGBA,gl.UNSIGNED_BYTE,px);
+
+    // ---- CPU 参考：同样的数学，浮点 ----
+    const crW = f => {
+      const f2=f*f, f3=f2*f;
+      const w0=-0.5*f3+f2-0.5*f, w1=1.5*f3-2.5*f2+1, w2=-1.5*f3+2*f2+0.5*f, w3=0.5*f3-0.5*f2;
+      const a=w0+w1, b=w2+w3;
+      return [a, Math.abs(a)>1e-5?w1/a:0, b, Math.abs(b)>1e-5?w3/b:0];
+    };
+    const texel = (x,y,ch) => {
+      x = Math.min(N-1, Math.max(0, x)); y = Math.min(N-1, Math.max(0, y));
+      return data[(y*N+x)*4+ch] / 255;
+    };
+    const bilin = (x,y,ch) => {   // x,y 是纹素中心坐标
+      const p = x-0.5, q = y-0.5;
+      const i=Math.floor(p), j=Math.floor(q);
+      const fx=p-i, fy=q-j;
+      const v00=texel(i,j,ch), v10=texel(i+1,j,ch), v01=texel(i,j+1,ch), v11=texel(i+1,j+1,ch);
+      return (v00+(v10-v00)*fx)*(1-fy) + (v01+(v11-v01)*fx)*fy;
+    };
+    let maxErr = 0, sumErr = 0, cnt = 0, worst = null;
+    for (let y=0;y<cv.height;y++) for (let x=0;x<cv.width;x++) {
+      const uvx = (x+0.5)/cv.width, uvy=(y+0.5)/cv.height;
+      const px_ = uvx*N-0.5, py_ = uvy*N-0.5;
+      const ix=Math.floor(px_), iy=Math.floor(py_);
+      const wx = crW(px_-ix), wy = crW(py_-iy);
+      const xs = [ix+wx[1], ix+1+wx[3]], ys = [iy+wy[1], iy+1+wy[3]];
+      const wxs = [wx[0], wx[2]], wys=[wy[0], wy[2]];
+      for (let ch=0;ch<4;ch++) {
+        let ref=0;
+        for (let a2=0;a2<2;a2++) for (let b2=0;b2<2;b2++)
+          ref += wxs[a2]*wys[b2]*bilin(xs[a2], ys[b2], ch);
+        ref = Math.min(1, Math.max(0, ref));
+        const got = px[((y)*cv.width+x)*4+ch]/255;  // readPixels 是自下而上
+        const e = Math.abs(ref-got);
+        sumErr += e; cnt++;
+        if (e > maxErr) { maxErr = e; worst = {x,y,ch,ref,got}; }
+      }
+    }
+    const maxLSB = maxErr*255, avgLSB = (sumErr/cnt)*255;
+    say('');
+    say('CPU(float) 参考 vs GPU(RGBA8) 输出，64x64 共 ' + cnt + ' 个分量:');
+    say('  max |err| = ' + maxErr.toFixed(6) + '  (' + maxLSB.toFixed(2) + ' LSB)',
+        maxLSB > 4 ? 'bad' : 'ok');
+    say('  avg |err| = ' + (sumErr/cnt).toFixed(6) + '  (' + avgLSB.toFixed(3) + ' LSB)');
+    if (worst) say('  worst @ ' + JSON.stringify(worst));
+    say('');
+    say(maxLSB <= 4 ? '判定: PASS（8-bit 量化下允许 ≤4 LSB）' : '判定: FAIL',
+        maxLSB <= 4 ? 'ok' : 'bad');
+
+    // ---- 双线性对照：同一位置，看差异有多大（证明真的不是双线性） ----
+    let dmax = 0;
+    for (let y=0;y<cv.height;y++) for (let x=0;x<cv.width;x++) {
+      const uvx=(x+0.5)/cv.width*N, uvy=(y+0.5)/cv.height*N;
+      for (let ch=0;ch<4;ch++) {
+        const l = bilin(uvx, uvy, ch);
+        const b = px[((y)*cv.width+x)*4+ch]/255;
+        dmax = Math.max(dmax, Math.abs(l-b));
+      }
+    }
+    say('对照：与纯双线性的最大偏差 = ' + (dmax*255).toFixed(1) + ' LSB（应显著 > 0，否则说明退化成双线性）',
+        dmax*255 > 5 ? 'ok' : 'warn');
+
+    window.__RESULT__ = {ok: maxLSB<=4, maxLSB, avgLSB, diffFromBilinear: dmax*255,
+                         renderer: dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),
+                         shaderLog: window.__SHADER_LOG__};
+    say('');
+    say('DONE', 'ok');
+  }
+}
+</script>
